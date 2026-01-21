@@ -1,4 +1,4 @@
-@smoke @demo
+@smoke @demo @regression
 Feature: APEX UI Login Demo
   As a test automation engineer
   I want to verify the APEX UI login functionality
