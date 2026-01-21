@@ -1,0 +1,204 @@
+name: Skeleton Automation Framework CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to run tests'
+        required: true
+        default: 'qa'
+        type: choice
+        options:
+          - dev
+          - qa
+          - uat
+      browser:
+        description: 'Browser to use'
+        required: true
+        default: 'chromium'
+        type: choice
+        options:
+          - chromium
+          - firefox
+          - webkit
+      tags:
+        description: 'Tags to run (e.g., @smoke, @regression)'
+        required: false
+        default: '@smoke'
+
+jobs:
+  test:
+    name: Run Automation Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Create reports directory
+        run: |
+          mkdir -p reports/cucumber-report
+          mkdir -p reports/screenshots
+          mkdir -p reports/videos
+          mkdir -p reports/logs
+
+      - name: Run Smoke Tests
+        if: github.event_name == 'pull_request'
+        env:
+          ENV: qa
+          BROWSER: ${{ matrix.browser }}
+          HEADLESS: true
+        run: npm run test:smoke
+        continue-on-error: true
+
+      - name: Run Regression Tests
+        if: github.event_name == 'push'
+        env:
+          ENV: qa
+          BROWSER: ${{ matrix.browser }}
+          HEADLESS: true
+        run: npm run test:regression
+        continue-on-error: true
+
+      - name: Run Custom Tests
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          ENV: ${{ github.event.inputs.environment }}
+          BROWSER: ${{ github.event.inputs.browser }}
+          HEADLESS: true
+        run: cucumber-js --tags "${{ github.event.inputs.tags }}"
+        continue-on-error: true
+
+      - name: Generate Cucumber HTML Report
+        if: always()
+        run: |
+          node -e "
+          const reporter = require('cucumber-html-reporter');
+          const options = {
+            theme: 'bootstrap',
+            jsonFile: 'reports/cucumber-report/cucumber-report.json',
+            output: 'reports/cucumber-report/cucumber-report.html',
+            reportSuiteAsScenarios: true,
+            scenarioTimestamp: true,
+            launchReport: false,
+            metadata: {
+              'App Version': '1.0.0',
+              'Test Environment': process.env.ENV || 'qa',
+              'Browser': process.env.BROWSER || 'chromium',
+              'Platform': process.platform,
+              'Parallel': 'Scenarios',
+              'Executed': 'GitHub Actions'
+            }
+          };
+          reporter.generate(options);
+          "
+
+      - name: Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.browser }}
+          path: |
+            reports/
+          retention-days: 30
+
+      - name: Upload Screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ matrix.browser }}
+          path: reports/screenshots/
+          retention-days: 7
+
+      - name: Upload Videos
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: videos-${{ matrix.browser }}
+          path: reports/videos/
+          retention-days: 7
+
+      - name: Publish Test Results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Test Results - ${{ matrix.browser }}
+          path: reports/cucumber-report/cucumber-report.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Comment PR with Test Results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'reports/cucumber-report/cucumber-report.json';
+            
+            if (fs.existsSync(reportPath)) {
+              const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              
+              let passed = 0, failed = 0, skipped = 0;
+              report.forEach(feature => {
+                feature.elements.forEach(scenario => {
+                  const status = scenario.steps.every(step => step.result.status === 'passed');
+                  if (status) passed++;
+                  else failed++;
+                });
+              });
+              
+              const comment = `## 🧪 Test Results - ${{ matrix.browser }}
+              
+              | Status | Count |
+              |--------|-------|
+              | ✅ Passed | ${passed} |
+              | ❌ Failed | ${failed} |
+              | ⏭️ Skipped | ${skipped} |
+              
+              **Browser:** ${{ matrix.browser }}
+              **Environment:** qa
+              
+              [View Full Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              `;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+
+  notify:
+    name: Notify Results
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Send notification
+        run: |
+          echo "Tests completed. Check artifacts for detailed reports."
+          echo "Status: ${{ needs.test.result }}"
